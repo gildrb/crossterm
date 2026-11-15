@@ -243,16 +243,31 @@ pub(crate) fn read_supports_keyboard_enhancement_raw() -> io::Result<bool> {
 ///   reader's release lost every round on a loaded box with its answer
 ///   already queued. A parked probe gets the lock at the reader's next
 ///   (fair) release, then reads the answer under that one guard.
+/// - The window closes with a look, never without one. A probe thread kept
+///   off the CPU on a loaded box can wake past the deadline, or find the
+///   lock held by a reader that is itself off the CPU, with its answer
+///   long queued. Past the deadline it waits for the lock without a time
+///   limit and looks once before it concludes there is no answer. This
+///   wait ends as long as no reader holds the lock while it waits on the
+///   tty with no timeout (a blocking `read` with nothing polled first):
+///   every holder then releases at the end of one bounded poll.
 #[cfg(feature = "events")]
 fn read_keyboard_enhancement_answer() -> io::Result<bool> {
+    use std::time::{Duration, Instant};
+    read_keyboard_enhancement_answer_by(Instant::now() + Duration::from_millis(250))
+}
+
+/// [`read_keyboard_enhancement_answer`] with its window ending at
+/// `deadline`.
+#[cfg(feature = "events")]
+fn read_keyboard_enhancement_answer_by(deadline: std::time::Instant) -> io::Result<bool> {
     use crate::event::{
         filter::{KeyboardEnhancementFlagsFilter, PrimaryDeviceAttributesFilter},
-        try_lock_internal_event_reader_for, InternalEvent,
+        lock_internal_event_reader, try_lock_internal_event_reader_for, InternalEvent,
     };
     use parking_lot::MappedMutexGuard;
     use std::time::{Duration, Instant};
 
-    let deadline = Instant::now() + Duration::from_millis(250);
     let between_looks = Duration::from_millis(1);
     let timed_out = || {
         io::Error::new(
@@ -262,13 +277,11 @@ fn read_keyboard_enhancement_answer() -> io::Result<bool> {
     };
     loop {
         let leftover = deadline.saturating_duration_since(Instant::now());
-        if leftover.is_zero() {
-            return Err(timed_out());
-        }
-        let mut reader = match try_lock_internal_event_reader_for(leftover) {
-            Some(reader) => reader,
-            None => return Err(timed_out()),
-        };
+        // Past the deadline (or once its wait outlasted the window) the
+        // probe waits for the holder's release, however long its starved
+        // poll takes, for the closing look.
+        let mut reader =
+            try_lock_internal_event_reader_for(leftover).unwrap_or_else(lock_internal_event_reader);
         // A poll error retries inside the same window.
         if let Ok(true) = reader.poll(Some(Duration::ZERO), &KeyboardEnhancementFlagsFilter) {
             return match reader.read(&KeyboardEnhancementFlagsFilter) {
@@ -279,6 +292,10 @@ fn read_keyboard_enhancement_answer() -> io::Result<bool> {
                 }
                 _ => Ok(false),
             };
+        }
+        // That was the look at (or past) the deadline.
+        if Instant::now() >= deadline {
+            return Err(timed_out());
         }
         // The app reader, if parked on the lock, takes the next turn.
         MappedMutexGuard::unlock_fair(reader);
@@ -347,7 +364,7 @@ fn wrap_with_result(result: i32) -> io::Result<()> {
 
 #[cfg(all(test, feature = "events"))]
 mod tests {
-    use super::read_keyboard_enhancement_answer;
+    use super::{read_keyboard_enhancement_answer, read_keyboard_enhancement_answer_by};
     use crate::event::{
         filter::KeyboardEnhancementFlagsFilter, lock_internal_event_reader,
         read::InternalEventReader, reader_lock_wait, source::EventSource, InternalEvent,
@@ -464,6 +481,80 @@ mod tests {
         assert!(
             waits.iter().all(|wait| *wait == Some(Duration::ZERO)),
             "the probe waited on the tty with the reader locked: {waits:?}"
+        );
+    }
+
+    /// A probe thread kept off the CPU wakes past its deadline with its
+    /// answer already queued (the app reader read it inside the window).
+    /// It takes its closing look and finds the answer; before, it timed out
+    /// without looking and the session ran without the keyboard protocol.
+    #[test]
+    #[serial]
+    fn a_probe_waking_past_its_deadline_still_finds_its_queued_answer() {
+        *lock_internal_event_reader() = InternalEventReader::for_test(
+            [
+                InternalEvent::KeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+                ),
+                InternalEvent::PrimaryDeviceAttributes,
+            ],
+            None,
+        );
+
+        let answer = read_keyboard_enhancement_answer_by(Instant::now() - Duration::from_millis(1));
+        let left = lock_internal_event_reader()
+            .poll(Some(Duration::ZERO), &KeyboardEnhancementFlagsFilter);
+        *lock_internal_event_reader() = InternalEventReader::for_test([], None);
+
+        assert!(
+            matches!(answer, Ok(true)),
+            "the late probe missed its queued answer: {answer:?}"
+        );
+        assert!(
+            !matches!(left, Ok(true)),
+            "the probe left its answer queued"
+        );
+    }
+
+    /// The nightly's starvation: the app reader read the answer into the
+    /// queue, then went off the CPU inside its bounded poll with the lock
+    /// held, past the probe's whole window. The probe waits for that
+    /// release and finds the answer; before, its lock wait ended with the
+    /// window and it concluded there was no answer.
+    #[test]
+    #[serial]
+    fn a_reader_holding_the_lock_past_the_window_still_hands_over_the_answer() {
+        let (held_tx, held_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut reader = lock_internal_event_reader();
+            *reader = InternalEventReader::for_test(
+                [
+                    InternalEvent::KeyboardEnhancementFlags(
+                        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+                    ),
+                    InternalEvent::PrimaryDeviceAttributes,
+                ],
+                None,
+            );
+            held_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(600));
+            MappedMutexGuard::unlock_fair(reader);
+        });
+        held_rx.recv().unwrap();
+
+        let answer = read_keyboard_enhancement_answer();
+        reader.join().unwrap();
+        let left = lock_internal_event_reader()
+            .poll(Some(Duration::ZERO), &KeyboardEnhancementFlagsFilter);
+        *lock_internal_event_reader() = InternalEventReader::for_test([], None);
+
+        assert!(
+            matches!(answer, Ok(true)),
+            "the probe gave up on a held lock with its answer queued: {answer:?}"
+        );
+        assert!(
+            !matches!(left, Ok(true)),
+            "the probe left its answer queued"
         );
     }
 }

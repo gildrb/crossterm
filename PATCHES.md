@@ -126,6 +126,31 @@ Pinned by: `terminal::sys::unix` tests
 on the version before this change); Eukhe's
 `terminal_state_differential_e2e` and `kitty_early_typing_e2e`.
 
+## 9. The keyboard check looks once more at its deadline
+
+Problem: on a loaded box the check concluded "no answer" while the
+terminal's answer had long been read into the shared queue: its thread woke
+past its 250ms deadline and gave up without looking, or the app reader that
+had queued the answer was itself off the CPU inside its bounded poll with
+the reader lock held, and the check's lock wait ended with the window. The
+session then ran without the keyboard protocol.
+
+Change: the window closes with a look. Past the deadline the check waits
+for the reader lock without a time limit and looks once before it reports
+the timeout. That wait ends whenever no reader holds the lock while it waits
+on the tty with no timeout (a blocking `read` with no `poll` first): every
+other holder releases at the end of one bounded poll. Eukhe polls before
+each read (its input loop, the selectors and the drains poll for at most
+50ms).
+
+Pinned by: `terminal::sys::unix` tests
+`a_probe_waking_past_its_deadline_still_finds_its_queued_answer` and
+`a_reader_holding_the_lock_past_the_window_still_hands_over_the_answer`
+(both fail on the version before this change); Eukhe's
+`terminal_state_differential_e2e` under CPU starvation
+(`the_config_selector_esc_close_restores_every_mode` failed 27 of 40 runs at
+nice 19 beside 48 busy loops).
+
 ## Updating to a newer upstream release
 
 Rebase these commits onto the upstream commit of the new release (its
